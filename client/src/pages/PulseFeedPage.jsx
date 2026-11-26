@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import api from '../api/axios';
 import { useAuth } from '../context/AuthContext';
 
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
 export default function PulseFeedPage() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
@@ -11,8 +13,6 @@ export default function PulseFeedPage() {
   const [activities, setActivities] = useState([]);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState('');
-
-  const isParent = user?.role === 'parent';
 
   const handleLogout = () => {
     logout();
@@ -24,11 +24,8 @@ export default function PulseFeedPage() {
       setLoading(true);
       setErrorMsg('');
       try {
-        const endpoint = isParent ? '/activities/parent/feed' : '/activities/student/feed';
-        const res = await api.get(endpoint);
-        if (isParent) {
-          setChildrenList(res.data.children || []);
-        }
+        const res = await api.get('/activities/parent/feed');
+        setChildrenList(res.data.children || []);
         setActivities(res.data.activities || []);
       } catch (err) {
         setErrorMsg(err.response?.data?.error || 'Failed to load your Daily Pulse feed.');
@@ -40,7 +37,7 @@ export default function PulseFeedPage() {
     if (user) {
       fetchFeed();
     }
-  }, [user, isParent]);
+  }, [user]);
 
   const getAttendanceBadge = (status) => {
     if (status === 'Present') return { backgroundColor: '#dcfce7', color: '#166534' };
@@ -48,14 +45,33 @@ export default function PulseFeedPage() {
     return { backgroundColor: '#fef3c7', color: '#b45309' };
   };
 
+  // Group subject activity logs by Date + Student for clean daily summary cards
+  const groupedDays = Object.values(
+    activities.reduce((acc, item) => {
+      const dateKey = String(item.activity_date).split('T')[0];
+      const key = `${dateKey}_${item.student_id}`;
+      if (!acc[key]) {
+        acc[key] = {
+          key,
+          activity_date: item.activity_date,
+          student_name: item.student_name,
+          grade: item.grade,
+          teacher_name: item.teacher_name,
+          attendance: item.attendance,
+          subjects: [],
+        };
+      }
+      acc[key].subjects.push(item);
+      return acc;
+    }, {})
+  );
+
   return (
     <div style={styles.page}>
       <header style={styles.navbar}>
         <div>
           <h1 style={styles.brand}>TuitPulse</h1>
-          <span style={styles.badge}>
-            {isParent ? 'Parent Portal' : 'Student Portal'}
-          </span>
+          <span style={styles.badge}>Parent Portal</span>
         </div>
         <div style={styles.navRight}>
           <span style={styles.userName}>{user?.full_name}</span>
@@ -66,86 +82,111 @@ export default function PulseFeedPage() {
       <main style={styles.main}>
         {errorMsg && <div style={styles.errorBox}>{errorMsg}</div>}
 
-        {/* Parent-specific: Auto-linked Children & Batch Overview */}
-        {isParent && (
-          <section style={styles.card}>
-            <h2 style={styles.cardTitle}>Linked Students & Active Batches</h2>
-            {loading ? (
-              <p style={styles.muted}>Checking linked student profiles...</p>
-            ) : childrenList.length === 0 ? (
-              <p style={styles.muted}>
-                No student profiles linked to <strong>{user?.mobile}</strong> yet. Once your child's teacher adds this mobile number to a batch, updates will appear here automatically.
-              </p>
-            ) : (
-              <div style={styles.childGrid}>
-                {childrenList.map((child) => (
-                  <div key={`${child.student_id}-${child.batch_id}`} style={styles.childCard}>
-                    <div style={styles.childName}>{child.student_name}</div>
-                    <div style={styles.childMeta}>
-                      <strong>{child.batch_name}</strong> {child.subject ? `• ${child.subject}` : ''}
+        {/* Linked Children & Recurring Weekly Subject Timetable */}
+        <section style={styles.card}>
+          <h2 style={styles.cardTitle}>Linked Student & Weekly Subject Timetable</h2>
+          {loading ? (
+            <p style={styles.muted}>Checking linked student profiles...</p>
+          ) : childrenList.length === 0 ? (
+            <p style={styles.muted}>
+              No student profiles linked to <strong>{user?.mobile}</strong> yet. Once your child's teacher adds this mobile number, updates will appear here automatically.
+            </p>
+          ) : (
+            <div style={styles.childStack}>
+              {childrenList.map((child) => (
+                <div key={child.student_id} style={styles.childCard}>
+                  <div style={styles.childHeader}>
+                    <div>
+                      <span style={styles.childName}>{child.student_name}</span>
+                      {child.grade && <span style={styles.gradeTag}>{child.grade}</span>}
                     </div>
-                    <div style={styles.childSub}>
-                      Teacher: {child.teacher_name} {child.timing ? `• ${child.timing}` : ''}
-                    </div>
+                    <div style={styles.childSub}>Teacher: <strong>{child.teacher_name}</strong></div>
                   </div>
-                ))}
-              </div>
-            )}
-          </section>
-        )}
 
-        {/* Daily Pulse Timeline */}
+                  {Array.isArray(child.subjects) && child.subjects.length > 0 && (
+                    <div style={styles.allSubjectsLine}>
+                      Enrolled Subjects: <strong>{child.subjects.join(', ')}</strong>
+                    </div>
+                  )}
+
+                  {/* Mon-Sun Subject Timetable Strip */}
+                  <div style={styles.timetableGrid}>
+                    {DAYS.map((day) => {
+                      const daySubjects = (child.schedule || [])
+                        .filter((s) => s.day_of_week === day)
+                        .map((s) => s.subject);
+                      return (
+                        <div key={day} style={styles.dayBox}>
+                          <div style={styles.dayLabel}>{day}</div>
+                          {daySubjects.length === 0 ? (
+                            <div style={styles.dayEmpty}>�</div>
+                          ) : (
+                            <div style={styles.dayPills}>
+                              {daySubjects.map((sub) => (
+                                <span key={sub} style={styles.miniSubjectPill}>{sub}</span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* Subject-Wise Daily Pulse Timeline */}
         <section style={styles.card}>
           <h2 style={styles.cardTitle}>Daily Pulse Timeline</h2>
           {loading ? (
             <p style={styles.muted}>Loading daily updates...</p>
-          ) : activities.length === 0 ? (
-            <p style={styles.muted}>No daily updates logged yet. Check back after today's class!</p>
+          ) : groupedDays.length === 0 ? (
+            <p style={styles.muted}>No daily updates logged yet. Check back after today's tuition session!</p>
           ) : (
             <div style={styles.feedList}>
-              {activities.map((item) => (
-                <div key={item.id} style={styles.feedItem}>
+              {groupedDays.map((group) => (
+                <div key={group.key} style={styles.feedItem}>
                   <div style={styles.feedTop}>
                     <div>
                       <span style={styles.dateTag}>
-                        {new Date(item.activity_date).toLocaleDateString('en-IN', {
+                        {new Date(group.activity_date).toLocaleDateString('en-IN', {
                           weekday: 'short',
                           day: 'numeric',
                           month: 'short',
                           year: 'numeric',
                         })}
                       </span>
-                      <strong style={styles.feedTitle}>
-                        {isParent ? `${item.student_name} — ` : ''}
-                        {item.batch_name}
-                      </strong>
-                      {item.subject && <span style={styles.subjectTag}>{item.subject}</span>}
+                      <strong style={styles.feedTitle}>{group.student_name}</strong>
+                      {group.grade && <span style={styles.gradeTag}>{group.grade}</span>}
                     </div>
-                    <span style={{ ...styles.statusPill, ...getAttendanceBadge(item.attendance) }}>
-                      {item.attendance}
+                    <span style={{ ...styles.statusPill, ...getAttendanceBadge(group.attendance) }}>
+                      {group.attendance}
                     </span>
                   </div>
 
-                  <div style={styles.metricsRow}>
-                    <div style={styles.metricBox}>
-                      <span style={styles.metricLabel}>Homework</span>
-                      <span style={styles.metricVal}>{item.homework_status || 'Assigned'}</span>
-                    </div>
-                    <div style={styles.metricBox}>
-                      <span style={styles.metricLabel}>Test Score</span>
-                      <span style={styles.metricVal}>{item.test_score || '—'}</span>
-                    </div>
-                    <div style={styles.metricBox}>
-                      <span style={styles.metricLabel}>Teacher</span>
-                      <span style={styles.metricVal}>{item.teacher_name}</span>
-                    </div>
+                  {/* Subject-by-Subject Rows */}
+                  <div style={styles.subjectRowsWrap}>
+                    {group.subjects.map((subItem) => (
+                      <div key={subItem.id} style={styles.subjectDetailCard}>
+                        <div style={styles.subjectDetailTop}>
+                          <span style={styles.subjectBadge}>{subItem.subject}</span>
+                          <div style={styles.subjectMetaPills}>
+                            <span style={styles.hwPill}>HW: <strong>{subItem.homework_status || 'Assigned'}</strong></span>
+                            {subItem.test_score && (
+                              <span style={styles.scorePill}>Test: <strong>{subItem.test_score}</strong></span>
+                            )}
+                          </div>
+                        </div>
+                        {subItem.teacher_remark && (
+                          <div style={styles.remarkText}>
+                            <strong>Remark:</strong> {subItem.teacher_remark}
+                          </div>
+                        )}
+                      </div>
+                    ))}
                   </div>
-
-                  {item.teacher_remark && (
-                    <div style={styles.remarkBox}>
-                      <strong>Teacher Remark:</strong> {item.teacher_remark}
-                    </div>
-                  )}
                 </div>
               ))}
             </div>
@@ -186,7 +227,7 @@ const styles = {
     cursor: 'pointer',
     fontWeight: 600,
   },
-  main: { maxWidth: '960px', margin: '0 auto', padding: '1.5rem' },
+  main: { maxWidth: '980px', margin: '0 auto', padding: '1.5rem' },
   card: {
     backgroundColor: '#ffffff',
     borderRadius: '12px',
@@ -195,16 +236,49 @@ const styles = {
     marginBottom: '1.25rem',
   },
   cardTitle: { margin: '0 0 1rem', fontSize: '1.15rem', color: '#0f172a' },
-  childGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '0.85rem' },
+  childStack: { display: 'flex', flexDirection: 'column', gap: '1rem' },
   childCard: {
-    padding: '1rem',
+    padding: '1.1rem',
     borderRadius: '10px',
     border: '1px solid #dbeafe',
     backgroundColor: '#eff6ff',
   },
-  childName: { fontWeight: 700, fontSize: '1.05rem', color: '#1e3a8a' },
-  childMeta: { fontSize: '0.9rem', color: '#1e40af', marginTop: '0.25rem' },
-  childSub: { fontSize: '0.82rem', color: '#475569', marginTop: '0.25rem' },
+  childHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' },
+  childName: { fontWeight: 700, fontSize: '1.1rem', color: '#1e3a8a' },
+  gradeTag: {
+    marginLeft: '0.5rem',
+    backgroundColor: '#dbeafe',
+    color: '#1e40af',
+    padding: '0.15rem 0.5rem',
+    borderRadius: '6px',
+    fontSize: '0.78rem',
+    fontWeight: 600,
+  },
+  childSub: { fontSize: '0.85rem', color: '#475569' },
+  allSubjectsLine: { fontSize: '0.85rem', color: '#1e40af', marginTop: '0.4rem', marginBottom: '0.75rem' },
+  timetableGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(105px, 1fr))',
+    gap: '0.5rem',
+  },
+  dayBox: {
+    backgroundColor: '#ffffff',
+    border: '1px solid #cbd5e1',
+    borderRadius: '8px',
+    padding: '0.5rem',
+    textAlign: 'center',
+  },
+  dayLabel: { fontSize: '0.75rem', fontWeight: 700, color: '#475569', marginBottom: '0.35rem', textTransform: 'uppercase' },
+  dayEmpty: { fontSize: '0.8rem', color: '#94a3b8' },
+  dayPills: { display: 'flex', flexDirection: 'column', gap: '0.25rem' },
+  miniSubjectPill: {
+    backgroundColor: '#eff6ff',
+    color: '#1d4ed8',
+    fontSize: '0.76rem',
+    fontWeight: 600,
+    padding: '0.15rem 0.35rem',
+    borderRadius: '4px',
+  },
   feedList: { display: 'flex', flexDirection: 'column', gap: '1rem' },
   feedItem: {
     padding: '1.1rem',
@@ -230,37 +304,59 @@ const styles = {
     fontWeight: 600,
     marginRight: '0.6rem',
   },
-  feedTitle: { fontSize: '1rem', color: '#0f172a' },
-  subjectTag: {
-    marginLeft: '0.5rem',
-    fontSize: '0.8rem',
-    color: '#2563eb',
-    fontWeight: 600,
-  },
+  feedTitle: { fontSize: '1.02rem', color: '#0f172a' },
   statusPill: {
     padding: '0.25rem 0.7rem',
     borderRadius: '999px',
     fontSize: '0.82rem',
     fontWeight: 700,
   },
-  metricsRow: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(3, 1fr)',
-    gap: '0.75rem',
+  subjectRowsWrap: { display: 'flex', flexDirection: 'column', gap: '0.6rem' },
+  subjectDetailCard: {
     backgroundColor: '#f8fafc',
-    padding: '0.75rem',
+    border: '1px solid #e2e8f0',
     borderRadius: '8px',
+    padding: '0.7rem 0.9rem',
   },
-  metricBox: { display: 'flex', flexDirection: 'column' },
-  metricLabel: { fontSize: '0.75rem', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.03em' },
-  metricVal: { fontSize: '0.92rem', fontWeight: 600, color: '#1e293b', marginTop: '0.15rem' },
-  remarkBox: {
-    marginTop: '0.75rem',
-    padding: '0.65rem 0.85rem',
-    borderRadius: '8px',
-    backgroundColor: '#fefce8',
+  subjectDetailTop: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: '0.5rem',
+  },
+  subjectBadge: {
+    backgroundColor: '#2563eb',
+    color: '#ffffff',
+    padding: '0.2rem 0.6rem',
+    borderRadius: '6px',
+    fontSize: '0.82rem',
+    fontWeight: 700,
+  },
+  subjectMetaPills: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem' },
+  hwPill: {
+    backgroundColor: '#ffffff',
+    border: '1px solid #cbd5e1',
+    padding: '0.2rem 0.55rem',
+    borderRadius: '6px',
+    fontSize: '0.82rem',
+    color: '#334155',
+  },
+  scorePill: {
+    backgroundColor: '#f0fdf4',
+    border: '1px solid #bbf7d0',
+    padding: '0.2rem 0.55rem',
+    borderRadius: '6px',
+    fontSize: '0.82rem',
+    color: '#166534',
+  },
+  remarkText: {
+    marginTop: '0.5rem',
+    fontSize: '0.86rem',
     color: '#854d0e',
-    fontSize: '0.88rem',
+    backgroundColor: '#fefce8',
+    padding: '0.45rem 0.65rem',
+    borderRadius: '6px',
   },
   errorBox: { backgroundColor: '#fee2e2', color: '#b91c1c', padding: '0.8rem 1rem', borderRadius: '8px', marginBottom: '1rem', fontWeight: 500 },
   muted: { color: '#64748b', fontSize: '0.92rem', margin: 0 },

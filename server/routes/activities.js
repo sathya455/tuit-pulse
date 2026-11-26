@@ -3,40 +3,114 @@ const db = require('../db/db');
 const { verifyToken, requireRole } = require('../middleware/auth');
 
 const router = express.Router();
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-// All activity routes require authentication
 router.use(verifyToken);
 
-// POST /api/activities/bulk â€” Teacher logs/updates daily pulse for an entire batch
-router.post('/bulk', requireRole('teacher'), async (req, res) => {
-  const { batch_id, activity_date, entries } = req.body;
+// GET /api/activities/daily?date=YYYY-MM-DD — Load scheduled subjects & existing logs for all teacher's students on a date
+router.get('/daily', requireRole('teacher'), async (req, res) => {
+  const targetDate = req.query.date || new Date().toISOString().split('T')[0];
+  const parsed = new Date(`${targetDate}T00:00:00`);
+  const dayName = DAY_NAMES[parsed.getDay()];
 
-  if (!batch_id || !Array.isArray(entries) || entries.length === 0) {
-    return res.status(400).json({ error: 'Batch ID and student entries are required.' });
+  try {
+    const studentsRes = await db.query(
+      `SELECT id, student_name, grade, subjects, parent_mobile
+       FROM students
+       WHERE teacher_id = $1
+       ORDER BY student_name ASC`,
+      [req.user.id]
+    );
+
+    const studentIds = studentsRes.rows.map((s) => s.id);
+    if (studentIds.length === 0) {
+      return res.json({ date: targetDate, day_of_week: dayName, students: [] });
+    }
+
+    const [schedRes, logsRes] = await Promise.all([
+      db.query(
+        `SELECT student_id, subject FROM student_weekly_schedule
+         WHERE student_id = ANY($1::int[]) AND day_of_week = $2
+         ORDER BY id ASC`,
+        [studentIds, dayName]
+      ),
+      db.query(
+        `SELECT * FROM daily_activities
+         WHERE student_id = ANY($1::int[]) AND activity_date = $2
+         ORDER BY id ASC`,
+        [studentIds, targetDate]
+      ),
+    ]);
+
+    const payload = studentsRes.rows.map((st) => {
+      const scheduledSubjects = schedRes.rows
+        .filter((r) => r.student_id === st.id)
+        .map((r) => r.subject);
+      const existingLogs = logsRes.rows.filter((l) => l.student_id === st.id);
+
+      // Combine scheduled subjects + any extra logged subjects for this date
+      const subjectSet = new Set(scheduledSubjects);
+      existingLogs.forEach((l) => subjectSet.add(l.subject));
+
+      const subjectEntries = Array.from(subjectSet).map((subj) => {
+        const match = existingLogs.find((l) => l.subject === subj);
+        return {
+          subject: subj,
+          is_scheduled: scheduledSubjects.includes(subj),
+          homework_status: match?.homework_status || 'Assigned',
+          test_score: match?.test_score || '',
+          teacher_remark: match?.teacher_remark || '',
+        };
+      });
+
+      const attendance = existingLogs[0]?.attendance || 'Present';
+
+      return {
+        student_id: st.id,
+        student_name: st.student_name,
+        grade: st.grade,
+        all_subjects: st.subjects || [],
+        attendance,
+        entries: subjectEntries,
+      };
+    });
+
+    res.json({ date: targetDate, day_of_week: dayName, students: payload });
+  } catch (err) {
+    console.error('Fetch daily schedule activities error:', err);
+    res.status(500).json({ error: 'Server error fetching daily activities.' });
+  }
+});
+
+// POST /api/activities/bulk — Save attendance & subject-wise daily pulse logs for a date
+router.post('/bulk', requireRole('teacher'), async (req, res) => {
+  const { activity_date, entries } = req.body;
+  // entries: [{ student_id, subject, attendance, homework_status, test_score, teacher_remark }]
+
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return res.status(400).json({ error: 'At least one subject activity entry is required.' });
   }
 
   const logDate = activity_date || new Date().toISOString().split('T')[0];
 
   try {
-    // Verify teacher owns this batch
-    const batchCheck = await db.query(
-      'SELECT id FROM batches WHERE id = $1 AND teacher_id = $2',
-      [batch_id, req.user.id]
-    );
-    if (batchCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Batch not found or unauthorized.' });
-    }
-
     const savedRecords = [];
     for (const entry of entries) {
-      const { student_id, attendance, homework_status, test_score, teacher_remark } = entry;
-      if (!student_id) continue;
+      const { student_id, subject, attendance, homework_status, test_score, teacher_remark } = entry;
+      if (!student_id || !subject?.trim()) continue;
+
+      // Verify teacher owns student
+      const check = await db.query(
+        'SELECT id FROM students WHERE id = $1 AND teacher_id = $2',
+        [student_id, req.user.id]
+      );
+      if (check.rows.length === 0) continue;
 
       const result = await db.query(
         `INSERT INTO daily_activities
-          (student_id, batch_id, activity_date, attendance, homework_status, test_score, teacher_remark)
+          (student_id, activity_date, subject, attendance, homework_status, test_score, teacher_remark)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (student_id, batch_id, activity_date)
+         ON CONFLICT (student_id, activity_date, subject)
          DO UPDATE SET
            attendance = EXCLUDED.attendance,
            homework_status = EXCLUDED.homework_status,
@@ -45,8 +119,8 @@ router.post('/bulk', requireRole('teacher'), async (req, res) => {
          RETURNING *`,
         [
           student_id,
-          batch_id,
           logDate,
+          subject.trim(),
           attendance || 'Present',
           homework_status?.trim() || 'Assigned',
           test_score?.trim() || null,
@@ -57,7 +131,7 @@ router.post('/bulk', requireRole('teacher'), async (req, res) => {
     }
 
     res.status(201).json({
-      message: `Saved daily pulse for ${savedRecords.length} student(s).`,
+      message: `Saved ${savedRecords.length} subject pulse log(s) for ${logDate}.`,
       date: logDate,
       records: savedRecords,
     });
@@ -67,105 +141,60 @@ router.post('/bulk', requireRole('teacher'), async (req, res) => {
   }
 });
 
-// GET /api/activities/batch/:batchId?date=YYYY-MM-DD â€” Teacher views a batch's logs for a given date
-router.get('/batch/:batchId', requireRole('teacher'), async (req, res) => {
-  const { batchId } = req.params;
-  const targetDate = req.query.date || new Date().toISOString().split('T')[0];
-
-  try {
-    const batchCheck = await db.query(
-      'SELECT id FROM batches WHERE id = $1 AND teacher_id = $2',
-      [batchId, req.user.id]
-    );
-    if (batchCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Batch not found or unauthorized.' });
-    }
-
-    const result = await db.query(
-      `SELECT s.id AS student_id, s.student_name, s.parent_mobile,
-              da.id AS activity_id, da.activity_date,
-              COALESCE(da.attendance, 'Present') AS attendance,
-              COALESCE(da.homework_status, 'Assigned') AS homework_status,
-              da.test_score, da.teacher_remark
-       FROM students s
-       LEFT JOIN daily_activities da
-         ON da.student_id = s.id AND da.batch_id = $1 AND da.activity_date = $2
-       WHERE s.batch_id = $1
-       ORDER BY s.student_name ASC`,
-      [batchId, targetDate]
-    );
-
-    res.json({ date: targetDate, entries: result.rows });
-  } catch (err) {
-    console.error('Fetch batch activities error:', err);
-    res.status(500).json({ error: 'Server error fetching batch activities.' });
-  }
-});
-
-// GET /api/activities/parent/feed â€” Parent views linked children and their daily pulse logs
+// GET /api/activities/parent/feed — Parent views linked children, their weekly subject timetable & daily logs
 router.get('/parent/feed', requireRole('parent'), async (req, res) => {
   try {
-    // 1. Fetch all students linked to this parent
-    const childrenResult = await db.query(
-      `SELECT s.id AS student_id, s.student_name, b.id AS batch_id,
-              b.batch_name, b.subject, b.timing, u.full_name AS teacher_name
+    const childrenRes = await db.query(
+      `SELECT s.id AS student_id, s.student_name, s.grade, s.subjects,
+              COALESCE(u_direct.full_name, u_batch.full_name) AS teacher_name
        FROM parent_student_links psl
        JOIN students s ON s.id = psl.student_id
-       JOIN batches b ON b.id = s.batch_id
-       JOIN users u ON u.id = b.teacher_id
+       LEFT JOIN users u_direct ON u_direct.id = s.teacher_id
+       LEFT JOIN batches b ON b.id = s.batch_id
+       LEFT JOIN users u_batch ON u_batch.id = b.teacher_id
        WHERE psl.parent_user_id = $1
        ORDER BY s.student_name ASC`,
       [req.user.id]
     );
 
-    if (childrenResult.rows.length === 0) {
+    if (childrenRes.rows.length === 0) {
       return res.json({ children: [], activities: [] });
     }
 
-    const studentIds = childrenResult.rows.map((c) => c.student_id);
+    const studentIds = childrenRes.rows.map((c) => c.student_id);
 
-    // 2. Fetch recent daily activity logs for those linked students
-    const activitiesResult = await db.query(
-      `SELECT da.*, s.student_name, b.batch_name, b.subject, u.full_name AS teacher_name
-       FROM daily_activities da
-       JOIN students s ON s.id = da.student_id
-       JOIN batches b ON b.id = da.batch_id
-       JOIN users u ON u.id = b.teacher_id
-       WHERE da.student_id = ANY($1::int[])
-       ORDER BY da.activity_date DESC, da.created_at DESC
-       LIMIT 50`,
-      [studentIds]
-    );
+    const [schedRes, activitiesRes] = await Promise.all([
+      db.query(
+        `SELECT * FROM student_weekly_schedule WHERE student_id = ANY($1::int[]) ORDER BY id ASC`,
+        [studentIds]
+      ),
+      db.query(
+        `SELECT da.*, s.student_name, s.grade,
+                COALESCE(u_direct.full_name, u_batch.full_name) AS teacher_name
+         FROM daily_activities da
+         JOIN students s ON s.id = da.student_id
+         LEFT JOIN users u_direct ON u_direct.id = s.teacher_id
+         LEFT JOIN batches b ON b.id = s.batch_id
+         LEFT JOIN users u_batch ON u_batch.id = b.teacher_id
+         WHERE da.student_id = ANY($1::int[])
+         ORDER BY da.activity_date DESC, da.id ASC
+         LIMIT 100`,
+        [studentIds]
+      ),
+    ]);
+
+    const childrenWithSchedule = childrenRes.rows.map((c) => ({
+      ...c,
+      schedule: schedRes.rows.filter((r) => r.student_id === c.student_id),
+    }));
 
     res.json({
-      children: childrenResult.rows,
-      activities: activitiesResult.rows,
+      children: childrenWithSchedule,
+      activities: activitiesRes.rows,
     });
   } catch (err) {
     console.error('Fetch parent feed error:', err);
     res.status(500).json({ error: 'Server error fetching parent feed.' });
-  }
-});
-
-// GET /api/activities/student/feed â€” Student views their own daily pulse logs
-router.get('/student/feed', requireRole('student'), async (req, res) => {
-  try {
-    const result = await db.query(
-      `SELECT da.*, s.student_name, b.batch_name, b.subject, u.full_name AS teacher_name
-       FROM daily_activities da
-       JOIN students s ON s.id = da.student_id
-       JOIN batches b ON b.id = da.batch_id
-       JOIN users u ON u.id = b.teacher_id
-       WHERE s.user_id = $1
-       ORDER BY da.activity_date DESC, da.created_at DESC
-       LIMIT 50`,
-      [req.user.id]
-    );
-
-    res.json({ activities: result.rows });
-  } catch (err) {
-    console.error('Fetch student feed error:', err);
-    res.status(500).json({ error: 'Server error fetching student feed.' });
   }
 });
 

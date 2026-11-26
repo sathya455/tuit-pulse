@@ -8,6 +8,7 @@ const db = require('./db/db');
 
 const authRoutes = require('./routes/auth');
 const batchRoutes = require('./routes/batches');
+const studentRoutes = require('./routes/students');
 const activityRoutes = require('./routes/activities');
 
 const app = express();
@@ -19,6 +20,7 @@ app.use(express.json());
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/batches', batchRoutes);
+app.use('/api/students', studentRoutes);
 app.use('/api/activities', activityRoutes);
 
 // Health-check & PostgreSQL connection test route
@@ -48,3 +50,4 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`TuitPulse server running on http://localhost:${PORT}`);
 });
+

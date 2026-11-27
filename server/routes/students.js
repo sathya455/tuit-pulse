@@ -1,4 +1,4 @@
-const express = require('express');
+ï»¿const express = require('express');
 const db = require('../db/db');
 const { verifyToken, requireRole } = require('../middleware/auth');
 
@@ -8,11 +8,12 @@ const VALID_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 router.use(verifyToken, requireRole('teacher'));
 
-// GET /api/students — List all students for this teacher with their weekly schedule
+// GET /api/students â€” List all students for this teacher with joined_date & weekly schedule
 router.get('/', async (req, res) => {
   try {
     const studentsRes = await db.query(
       `SELECT s.*,
+              TO_CHAR(COALESCE(s.created_at, CURRENT_DATE), 'YYYY-MM-DD') AS joined_date,
               EXISTS(SELECT 1 FROM parent_student_links psl WHERE psl.student_id = s.id) AS parent_registered
        FROM students s
        WHERE s.teacher_id = $1
@@ -42,9 +43,9 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST /api/students — Add a student directly with grade, subjects & parent mobile
+// POST /api/students â€” Add a student directly with grade, subjects, parent mobile & optional joined_date
 router.post('/', async (req, res) => {
-  const { student_name, grade, parent_mobile, subjects, weekly_schedule } = req.body;
+  const { student_name, grade, parent_mobile, subjects, joined_date, weekly_schedule } = req.body;
 
   if (!student_name || !parent_mobile) {
     return res.status(400).json({ error: 'Student name and parent mobile are required.' });
@@ -61,16 +62,24 @@ router.post('/', async (req, res) => {
       ? [...new Set(subjects.split(',').map((s) => s.trim()).filter(Boolean))]
       : [];
 
+  const validJoinedDate = joined_date && /^\d{4}-\d{2}-\d{2}$/.test(joined_date) ? joined_date : null;
+
   try {
-    const insertRes = await db.query(
-      `INSERT INTO students (teacher_id, student_name, grade, parent_mobile, subjects)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [req.user.id, student_name.trim(), grade?.trim() || null, cleanParentMobile, cleanSubjects]
-    );
+    const insertRes = validJoinedDate
+      ? await db.query(
+          `INSERT INTO students (teacher_id, student_name, grade, parent_mobile, subjects, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6::date)
+           RETURNING *, TO_CHAR(created_at, 'YYYY-MM-DD') AS joined_date`,
+          [req.user.id, student_name.trim(), grade?.trim() || null, cleanParentMobile, cleanSubjects, validJoinedDate]
+        )
+      : await db.query(
+          `INSERT INTO students (teacher_id, student_name, grade, parent_mobile, subjects)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING *, TO_CHAR(COALESCE(created_at, CURRENT_DATE), 'YYYY-MM-DD') AS joined_date`,
+          [req.user.id, student_name.trim(), grade?.trim() || null, cleanParentMobile, cleanSubjects]
+        );
     const newStudent = insertRes.rows[0];
 
-    // Insert optional initial weekly schedule if provided: [{ day_of_week: 'Mon', subject: 'Maths' }]
     if (Array.isArray(weekly_schedule)) {
       for (const slot of weekly_schedule) {
         if (VALID_DAYS.includes(slot.day_of_week) && slot.subject?.trim()) {
@@ -83,7 +92,6 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Auto-link Parent if already registered
     const parentUser = await db.query(
       "SELECT id FROM users WHERE mobile = $1 AND role = 'parent'",
       [cleanParentMobile]
@@ -109,10 +117,10 @@ router.post('/', async (req, res) => {
   }
 });
 
-// PUT /api/students/:studentId/schedule — Replace recurring Mon-Sun weekly subject timetable & subjects list
+// PUT /api/students/:studentId/schedule â€” Update weekly timetable, subjects & optional joined_date
 router.put('/:studentId/schedule', async (req, res) => {
   const { studentId } = req.params;
-  const { subjects, schedule } = req.body; // schedule: [{ day_of_week: 'Mon', subject: 'Maths' }, ...]
+  const { subjects, schedule, joined_date } = req.body;
 
   try {
     const ownerCheck = await db.query(
@@ -126,6 +134,10 @@ router.put('/:studentId/schedule', async (req, res) => {
     if (Array.isArray(subjects)) {
       const cleanSubjects = [...new Set(subjects.map((s) => s.trim()).filter(Boolean))];
       await db.query('UPDATE students SET subjects = $1 WHERE id = $2', [cleanSubjects, studentId]);
+    }
+
+    if (joined_date && /^\d{4}-\d{2}-\d{2}$/.test(joined_date)) {
+      await db.query('UPDATE students SET created_at = $1::date WHERE id = $2', [joined_date, studentId]);
     }
 
     await db.query('DELETE FROM student_weekly_schedule WHERE student_id = $1', [studentId]);
@@ -146,14 +158,14 @@ router.put('/:studentId/schedule', async (req, res) => {
       }
     }
 
-    res.json({ message: 'Weekly schedule updated!', schedule: inserted });
+    res.json({ message: 'Weekly schedule & start date updated!', schedule: inserted });
   } catch (err) {
     console.error('Update schedule error:', err);
     res.status(500).json({ error: 'Server error updating weekly schedule.' });
   }
 });
 
-// DELETE /api/students/:studentId — Remove a student
+// DELETE /api/students/:studentId â€” Remove a student
 router.delete('/:studentId', async (req, res) => {
   const { studentId } = req.params;
   try {
